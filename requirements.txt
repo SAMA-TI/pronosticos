@@ -1,0 +1,10 @@
+dash
+plotly
+dash-bootstrap-components
+ipywidgets
+flask
+requests
+pandas
+pytz
+openpyxl
+gunicorn
