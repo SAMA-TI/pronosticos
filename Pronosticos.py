@@ -348,6 +348,12 @@ app = dash.Dash(__name__)
 server = app.server
 #app.title = " 🌧️ Tablero de estaciones de precipitación"
 
+# Configure server for deployment with explicit port and host binding
+server.config.update(
+    PORT=int(os.environ.get('PORT', 8056)),
+    HOST=os.environ.get('HOST', '0.0.0.0')
+)
+
 
 app.layout = html.Div([
     html.H1(
@@ -718,11 +724,9 @@ def actualizar_grafico_meteo(subregion, municipio):
 # server = app.server
 
 if __name__ == "__main__":
-    # Get port from environment variable (for Render.com deployment)
-    port = int(os.environ.get("PORT", 8056))
-    
-    # Get host from environment variable (for Render.com deployment)  
-    host = os.environ.get("HOST", "0.0.0.0")
+    # Use the same configuration as defined in server.config
+    port = server.config.get('PORT', 8056)
+    host = server.config.get('HOST', '0.0.0.0')
     
     # Run the app
     app.run(host=host, port=port, debug=False)
