@@ -21,6 +21,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 import dash.dash_table as dt
 from dash import dcc
+import sys
+import flask
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
@@ -347,6 +349,20 @@ df_meta['subregion'] = df_meta['subregion_num'].map(mapa_subregiones)
 app = dash.Dash(__name__)
 server = app.server
 #app.title = " 🌧️ Tablero de estaciones de precipitación"
+
+# DEBUGGING - Print server information for deployment logs
+print("=== DEPLOYMENT DEBUG ===")
+print(f"Python version: {sys.version}")
+print(f"Flask version: {flask.__version__}")
+print(f"Dash version: {dash.__version__}")
+print(f"Server object type: {type(server)}")
+print(f"Server object id: {id(server)}")
+print(f"Module globals contains 'server': {'server' in globals()}")
+print(f"Module name: {__name__}")
+print("========================")
+
+# Make sure server is available at module level
+globals()['server'] = server
 
 # Configure server for deployment with explicit port and host binding
 server.config.update(
