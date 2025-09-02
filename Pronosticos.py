@@ -345,6 +345,7 @@ df_meta['subregion'] = df_meta['subregion_num'].map(mapa_subregiones)
 
 #Para tablero
 app = dash.Dash(__name__)
+server = app.server
 #app.title = " 🌧️ Tablero de estaciones de precipitación"
 
 
@@ -713,8 +714,8 @@ def actualizar_grafico_meteo(subregion, municipio):
 
 ## Hasta acá prueba
 
-# Expose the server for Gunicorn (required for Render.com)
-server = app.server
+# # Expose the server for Gunicorn (required for Render.com)
+# server = app.server
 
 if __name__ == "__main__":
     # Get port from environment variable (for Render.com deployment)
