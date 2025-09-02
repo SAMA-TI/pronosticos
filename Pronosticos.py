@@ -24,48 +24,129 @@ from dash import dcc
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
+# Simple in-memory cache for API responses (2 minutes max to ensure fresh data)
+_cache = {}
+CACHE_DURATION = 120  # 2 minutes in seconds
+
+def get_cached_or_fetch(cache_key, fetch_function, *args, **kwargs):
+    """
+    Simple cache mechanism with 2-minute expiration.
+    Since data expires every 5 minutes, this ensures we get fresh data
+    while reducing redundant API calls during deployment.
+    """
+    now = time.time()
+    
+    if cache_key in _cache:
+        cached_data, cached_time = _cache[cache_key]
+        if now - cached_time < CACHE_DURATION:
+            return cached_data
+    
+    # Cache miss or expired, fetch new data
+    try:
+        data = fetch_function(*args, **kwargs)
+        _cache[cache_key] = (data, now)
+        return data
+    except Exception as e:
+        # If fetch fails and we have expired cache, return it anyway
+        if cache_key in _cache:
+            print(f"Fetch failed, using expired cache for {cache_key}: {e}")
+            return _cache[cache_key][0]
+        raise
+
 # Estaciones de precipitación (sp)
 sp_codes = ["101", "102", "103", "104", "106", "108", "109", "131", "132", "133", "134", "135", 
             "136", "137", "138", "139", "140", "141", "142", "143", "144", "145", "146", "147", 
             "149", "150", "151", "152", "154", "155", "156", "157","158","159", "160", "161", "162", "163"]
 
-def obtener_datos_estacion(code, calidad=1):
+def obtener_datos_estacion(code, calidad=1, timeout=30, max_retries=3):
     page = 1
     datos = []
+    
     while True:
         url = f"https://sigran.antioquia.gov.co/api/v1/estaciones/sp_{code}/precipitacion?calidad={calidad}&page={page}"
-        response = requests.get(url, verify=False)
+        
+        # Retry logic for each request
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, verify=False, timeout=timeout)
+                response.raise_for_status()
+                break  # Success, exit retry loop
+                
+            except requests.Timeout:
+                print(f"Station {code}, page {page}: Request timed out (attempt {attempt + 1}/{max_retries})")
+                if attempt == max_retries - 1:  # Last attempt
+                    print(f"Station {code}: Max retries reached, skipping")
+                    return datos
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
+            except requests.RequestException as e:
+                print(f"Station {code}, page {page}: Request error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:  # Last attempt
+                    print(f"Station {code}: Max retries reached, skipping")
+                    return datos
+                time.sleep(2 ** attempt)  # Exponential backoff
+        else:
+            # If we exit the retry loop without breaking, we failed all attempts
+            return datos
+            
         if response.status_code != 200:
+            print(f"Station {code}, page {page}: HTTP {response.status_code}")
             break
-        data = response.json()
+            
+        try:
+            data = response.json()
+        except ValueError as e:
+            print(f"Station {code}, page {page}: JSON decode error: {e}")
+            break
+            
         values = data.get("values", [])
         if not values:
             break
+            
         datos.extend(values)
         page += 1
+        
         # Paramos si ya tenemos más de 72 horas de datos
         fechas = [pd.to_datetime(d['fecha']) for d in datos]
         if fechas and (max(fechas) - min(fechas)).total_seconds() > 72 * 3600:
             break
+            
     return datos
 
-def obtener_metadata_sp(code):
+def obtener_metadata_sp(code, timeout=30, max_retries=3):
     url = f"https://sigran.antioquia.gov.co/api/v1/estaciones/sp_{code}/"
-    resp = requests.get(url, verify=False)
-    if resp.status_code == 200:
-        d = resp.json()
-        return {
-            "estacion": code,
-            "codigo": d.get("codigo"),
-            "descripcion": d.get("descripcion"),
-            "nombre_web": d.get("nombre_web"),
-            "latitud": float(d.get("latitud", 0)),
-            "longitud": float(d.get("longitud", 0)),
-            "municipio": d.get("municipio"),
-            "region": d.get("region")
-        }
-    else:
-        return None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, verify=False, timeout=timeout)
+            if resp.status_code == 200:
+                d = resp.json()
+                return {
+                    "estacion": code,
+                    "codigo": d.get("codigo"),
+                    "descripcion": d.get("descripcion"),
+                    "nombre_web": d.get("nombre_web"),
+                    "latitud": float(d.get("latitud", 0)),
+                    "longitud": float(d.get("longitud", 0)),
+                    "municipio": d.get("municipio"),
+                    "region": d.get("region")
+                }
+            else:
+                print(f"Station {code} metadata: HTTP {resp.status_code}")
+                return None
+                
+        except requests.Timeout:
+            print(f"Station {code} metadata: Request timed out (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                
+        except requests.RequestException as e:
+            print(f"Station {code} metadata: Request error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # Exponential backoff
+    
+    print(f"Station {code} metadata: Max retries reached, skipping")
+    return None
 
 def procesar_datos(datos, ahora=None):
     if not datos:
@@ -148,15 +229,33 @@ def procesar_datos(datos, ahora=None):
 resultados = []
 metadata = []
 
-for code in sp_codes:
-    datos = obtener_datos_estacion(code)
-    resumen = procesar_datos(datos)
-    meta = obtener_metadata_sp(code)
-    if resumen and meta:
-        resumen["estacion"] = code
-        meta.update(resumen)
-        resultados.append(resumen)
-        metadata.append(meta)
+print(f"Starting data collection from {len(sp_codes)} stations...")
+start_time = time.time()
+
+for i, code in enumerate(sp_codes, 1):
+    print(f"Processing station {code} ({i}/{len(sp_codes)})...")
+    
+    try:
+        # Use cache for both data and metadata
+        datos = get_cached_or_fetch(f"data_{code}", obtener_datos_estacion, code)
+        resumen = procesar_datos(datos)
+        meta = get_cached_or_fetch(f"meta_{code}", obtener_metadata_sp, code)
+        
+        if resumen and meta:
+            resumen["estacion"] = code
+            meta.update(resumen)
+            resultados.append(resumen)
+            metadata.append(meta)
+            print(f"✓ Station {code}: Data loaded successfully")
+        else:
+            print(f"✗ Station {code}: No data or metadata available")
+            
+    except Exception as e:
+        print(f"✗ Station {code}: Unexpected error: {e}")
+        continue
+
+elapsed_time = time.time() - start_time
+print(f"Data collection completed: {len(resultados)} stations loaded in {elapsed_time:.1f} seconds")
 
 df_meta = pd.DataFrame(metadata)
 
@@ -614,12 +713,15 @@ def actualizar_grafico_meteo(subregion, municipio):
 
 ## Hasta acá prueba
 
+# Expose the server for Gunicorn (required for Render.com)
+server = app.server
+
 if __name__ == "__main__":
     # Get port from environment variable (for Render.com deployment)
     port = int(os.environ.get("PORT", 8056))
     
-    # Get host from environment variable (for Render.com deployment)
-    host = os.environ.get("HOST", "127.0.0.1")
+    # Get host from environment variable (for Render.com deployment)  
+    host = os.environ.get("HOST", "0.0.0.0")
     
     # Run the app
     app.run(host=host, port=port, debug=False)
