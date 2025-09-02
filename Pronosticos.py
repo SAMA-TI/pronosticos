@@ -3,12 +3,10 @@
 #!pip install -U plotly ipywidgets
 #!pip install dash flask
 
-import os
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, time as dtime, timezone
 import time  # para medir tiempo
-import math
 import pytz
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
@@ -21,12 +19,6 @@ from dash import dcc, html, dash_table
 from dash.dependencies import Input, Output
 import plotly.express as px
 import plotly.graph_objects as go
-import pandas as pd
-from datetime import datetime, timedelta
-import dash.dash_table as dt
-from dash import dcc
-import sys
-import flask
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
@@ -497,93 +489,151 @@ metadata = []
 # ====== EJECUCIÓN ASÍNCRONA (FASE 3) ======
 # Ejecutar la función asíncrona principal
 try:
+    print("🚀 Attempting async execution...")
+    
     # Verificar si ya estamos en un loop de eventos (como en Jupyter)
-    loop = asyncio.get_event_loop()
-    if loop.is_running():
-        # Estamos en un entorno que ya tiene un loop corriendo
-        print("⚠️  Event loop already running. Using nest_asyncio workaround...")
-        import nest_asyncio
-        nest_asyncio.apply()
-        resultados, metadata = loop.run_until_complete(cargar_todas_estaciones_async())
-    else:
-        # No hay loop corriendo, podemos usar asyncio.run normalmente
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Estamos en un entorno que ya tiene un loop corriendo
+            print("⚠️  Event loop already running. Using nest_asyncio workaround...")
+            import nest_asyncio
+            nest_asyncio.apply()
+            resultados, metadata = loop.run_until_complete(cargar_todas_estaciones_async())
+        else:
+            # No hay loop corriendo, podemos usar asyncio.run normalmente
+            print("✓ Using asyncio.run for execution...")
+            resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
+    except RuntimeError as re:
+        print(f"⚠️  RuntimeError with event loop: {re}")
+        print("Trying direct asyncio.run...")
         resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
         
-except ImportError:
-    # nest_asyncio no está disponible, usar asyncio.run
-    resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
+except ImportError as ie:
+    print(f"⚠️  ImportError: {ie}")
+    print("nest_asyncio no está disponible, usando asyncio.run...")
+    try:
+        resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
+    except Exception as e2:
+        print(f"❌ Error with direct asyncio.run: {e2}")
+        print("Falling back to synchronous version...")
+        resultados, metadata = [], []
+        
 except Exception as e:
-    print(f"❌ Error in async execution: {e}")
+    print(f"❌ Error in async execution: {type(e).__name__}: {e}")
+    import traceback
+    print("Full traceback:")
+    traceback.print_exc()
     print("Falling back to synchronous version...")
     
     # Fallback al código sincrónico si falla el asíncrono
-    print(f"Starting parallel data collection from {len(sp_codes)} stations...")
-    start_time = time.time()
+    try:
+        print(f"Starting parallel data collection from {len(sp_codes)} stations...")
+        start_time = time.time()
 
-    # Configurar el número de workers de forma inteligente
-    if len(sp_codes) <= 5:
-        max_workers = min(3, len(sp_codes))
-    elif len(sp_codes) <= 20:
-        max_workers = min(5, len(sp_codes))
-    else:
-        max_workers = min(10, len(sp_codes))
+        # Configurar el número de workers de forma inteligente
+        if len(sp_codes) <= 5:
+            max_workers = min(3, len(sp_codes))
+        elif len(sp_codes) <= 20:
+            max_workers = min(5, len(sp_codes))
+        else:
+            max_workers = min(10, len(sp_codes))
 
-    print(f"Using {max_workers} parallel workers for optimal API usage...")
+        print(f"Using {max_workers} parallel workers for optimal API usage...")
 
-    successful_stations = 0
-    failed_stations = 0
+        successful_stations = 0
+        failed_stations = 0
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_code = {executor.submit(procesar_estacion_completa, code): code for code in sp_codes}
-        
-        completed = 0
-        for future in as_completed(future_to_code):
-            completed += 1
-            code = future_to_code[future]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_code = {executor.submit(procesar_estacion_completa, code): code for code in sp_codes}
             
-            try:
-                resultado = future.result()
+            completed = 0
+            for future in as_completed(future_to_code):
+                completed += 1
+                code = future_to_code[future]
                 
-                if resultado['success']:
-                    resultados.append(resultado['resumen'])
-                    metadata.append(resultado['meta'])
-                    successful_stations += 1
-                    print(f"✓ Station {code}: Data loaded successfully ({completed}/{len(sp_codes)}) - Success: {successful_stations}")
-                else:
-                    failed_stations += 1
-                    print(f"✗ Station {code}: {resultado['error']} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
+                try:
+                    resultado = future.result()
                     
-            except Exception as e:
-                failed_stations += 1
-                print(f"✗ Station {code}: Unexpected error: {e} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
+                    if resultado['success']:
+                        resultados.append(resultado['resumen'])
+                        metadata.append(resultado['meta'])
+                        successful_stations += 1
+                        print(f"✓ Station {code}: Data loaded successfully ({completed}/{len(sp_codes)}) - Success: {successful_stations}")
+                    else:
+                        failed_stations += 1
+                        print(f"✗ Station {code}: {resultado['error']} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
+                        
+                except Exception as e:
+                    failed_stations += 1
+                    print(f"✗ Station {code}: Unexpected error: {e} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
 
-    elapsed_time = time.time() - start_time
-    success_rate = (successful_stations / len(sp_codes)) * 100 if sp_codes else 0
-    print(f"\n� Fallback parallel data collection completed:")
-    print(f"   • Total time: {elapsed_time:.1f} seconds")
-    print(f"   • Successful stations: {successful_stations}/{len(sp_codes)} ({success_rate:.1f}%)")
-    print(f"   • Failed stations: {failed_stations}")
-    print(f"   • Average time per station: {elapsed_time/len(sp_codes):.2f}s")
+            elapsed_time = time.time() - start_time
+            success_rate = (successful_stations / len(sp_codes)) * 100 if sp_codes else 0
+            print(f"\n🔄 Fallback parallel data collection completed:")
+            print(f"   • Total time: {elapsed_time:.1f} seconds")
+            print(f"   • Successful stations: {successful_stations}/{len(sp_codes)} ({success_rate:.1f}%)")
+            print(f"   • Failed stations: {failed_stations}")
+            print(f"   • Average time per station: {elapsed_time/len(sp_codes):.2f}s")
+        
+    except Exception as fallback_error:
+        print(f"❌ Critical error: Both async and sync methods failed!")
+        print(f"Fallback error: {type(fallback_error).__name__}: {fallback_error}")
+        # Crear listas vacías para evitar que la aplicación se rompa
+        resultados = []
+        metadata = []
+
+# Verificar si tenemos datos antes de crear DataFrames
 
 df_meta = pd.DataFrame(metadata)
 
 # Convertir a DataFrame para resumen (sin la serie de 120h)
-df_resultado = pd.DataFrame([{k: v for k, v in r.items() if k != "serie_120h"} for r in resultados])
-
-# Ordenar por defecto: estaciones con datos recientes primero, y por fecha más reciente
-df_resultado = df_resultado.sort_values(by=["datos_recientes", "fecha_ultimo_dato"], ascending=[False, False])
-
-# Crear copia con etiquetas legibles
-df_pie = df_resultado.copy()
-df_pie['datos_recientes'] = df_pie['datos_recientes'].map({1: 'Reciente', 0: 'No reciente'})
+if resultados:
+    df_resultado = pd.DataFrame([{k: v for k, v in r.items() if k != "serie_120h"} for r in resultados])
+    
+    # Verificar que las columnas necesarias existen antes de ordenar
+    required_columns = ["datos_recientes", "fecha_ultimo_dato"]
+    missing_columns = [col for col in required_columns if col not in df_resultado.columns]
+    
+    if missing_columns:
+        print(f"⚠️  Warning: Missing columns in df_resultado: {missing_columns}")
+        print(f"Available columns: {list(df_resultado.columns)}")
+        # Agregar columnas faltantes con valores por defecto
+        for col in missing_columns:
+            if col == "datos_recientes":
+                df_resultado[col] = 0
+            elif col == "fecha_ultimo_dato":
+                df_resultado[col] = pd.Timestamp.now()
+    
+    # Ordenar por defecto: estaciones con datos recientes primero, y por fecha más reciente
+    df_resultado = df_resultado.sort_values(by=["datos_recientes", "fecha_ultimo_dato"], ascending=[False, False])
+    
+    # Crear copia con etiquetas legibles
+    df_pie = df_resultado.copy()
+    df_pie['datos_recientes'] = df_pie['datos_recientes'].map({1: 'Reciente', 0: 'No reciente'})
+else:
+    print("⚠️  Warning: No data loaded from stations. Creating empty DataFrames.")
+    # Crear DataFrames vacíos con las columnas esperadas
+    df_resultado = pd.DataFrame(columns=[
+        "estacion", "acum_6h", "acum_24h", "acum_72h", 
+        "ultimo_dia_meteorologico", "ultimos_7_dias_meteorologicos", "ultimos_30_dias_meteorologicos",
+        "datos_recientes", "dias_sin_datos", "fecha_ultimo_dato"
+    ])
+    df_pie = df_resultado.copy()
+    df_pie['datos_recientes'] = df_pie['datos_recientes'].map({1: 'Reciente', 0: 'No reciente'})
 
 # Registros con datos recientes (menos de 7 días sin datos)
-df_reciente = df_resultado[df_resultado["dias_sin_datos"] < 7].copy()
-df_reciente = df_reciente.sort_values(by='estacion', ascending=True)
-
+if not df_resultado.empty and "dias_sin_datos" in df_resultado.columns:
+    df_reciente = df_resultado[df_resultado["dias_sin_datos"] < 7].copy()
+    df_reciente = df_reciente.sort_values(by='estacion', ascending=True)
+else:
+    df_reciente = pd.DataFrame(columns=df_resultado.columns)
 
 # Registros sin datos recientes (7 días o más sin datos)
-df_no_reciente = df_resultado[df_resultado["dias_sin_datos"] >= 7].copy()
+if not df_resultado.empty and "dias_sin_datos" in df_resultado.columns:
+    df_no_reciente = df_resultado[df_resultado["dias_sin_datos"] >= 7].copy()
+else:
+    df_no_reciente = pd.DataFrame(columns=df_resultado.columns)
 
 #Cruce de Info API con datos de Municipio y Subregión
 # Cargar el archivo Excel (Base de datos estaciones SAMA)
