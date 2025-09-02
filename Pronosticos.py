@@ -12,6 +12,10 @@ import math
 import pytz
 import warnings
 from urllib3.exceptions import InsecureRequestWarning
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import aiohttp
+import ssl
 import dash
 from dash import dcc, html, dash_table
 from dash.dependencies import Input, Output
@@ -60,7 +64,13 @@ sp_codes = ["101", "102", "103", "104", "106", "108", "109", "131", "132", "133"
             "136", "137", "138", "139", "140", "141", "142", "143", "144", "145", "146", "147", 
             "149", "150", "151", "152", "154", "155", "156", "157","158","159", "160", "161", "162", "163"]
 
-def obtener_datos_estacion(code, calidad=1, timeout=30, max_retries=3):
+def obtener_datos_estacion(code, calidad=1, timeout=20, max_retries=2):
+    """
+    Versión optimizada para ejecución paralela:
+    - Timeout más corto (20s vs 30s)
+    - Menos reintentos (2 vs 3) para evitar bloqueos prolongados
+    - Backoff exponencial más agresivo
+    """
     page = 1
     datos = []
     
@@ -79,14 +89,14 @@ def obtener_datos_estacion(code, calidad=1, timeout=30, max_retries=3):
                 if attempt == max_retries - 1:  # Last attempt
                     print(f"Station {code}: Max retries reached, skipping")
                     return datos
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(1.5 ** attempt)  # Shorter backoff for parallel execution
                 
             except requests.RequestException as e:
                 print(f"Station {code}, page {page}: Request error (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt == max_retries - 1:  # Last attempt
                     print(f"Station {code}: Max retries reached, skipping")
                     return datos
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(1.5 ** attempt)  # Shorter backoff for parallel execution
         else:
             # If we exit the retry loop without breaking, we failed all attempts
             return datos
@@ -115,7 +125,12 @@ def obtener_datos_estacion(code, calidad=1, timeout=30, max_retries=3):
             
     return datos
 
-def obtener_metadata_sp(code, timeout=30, max_retries=3):
+def obtener_metadata_sp(code, timeout=20, max_retries=2):
+    """
+    Versión optimizada para ejecución paralela:
+    - Timeout más corto (20s vs 30s) 
+    - Menos reintentos (2 vs 3)
+    """
     url = f"https://sigran.antioquia.gov.co/api/v1/estaciones/sp_{code}/"
     
     for attempt in range(max_retries):
@@ -140,15 +155,263 @@ def obtener_metadata_sp(code, timeout=30, max_retries=3):
         except requests.Timeout:
             print(f"Station {code} metadata: Request timed out (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(1.5 ** attempt)  # Shorter backoff
                 
         except requests.RequestException as e:
             print(f"Station {code} metadata: Request error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(1.5 ** attempt)  # Shorter backoff
     
     print(f"Station {code} metadata: Max retries reached, skipping")
     return None
+
+# ====== FUNCIONES ASÍNCRONAS (FASE 3) ======
+
+async def obtener_datos_estacion_async(session, code, calidad=1, timeout=20, max_retries=2):
+    """
+    Versión asíncrona para obtener datos de estación con aiohttp.
+    Mucho más eficiente que requests síncronos.
+    """
+    page = 1
+    datos = []
+    
+    # Configurar SSL para ignorar certificados (equivalente a verify=False)
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    while True:
+        url = f"https://sigran.antioquia.gov.co/api/v1/estaciones/sp_{code}/precipitacion?calidad={calidad}&page={page}"
+        
+        # Retry logic for each request
+        for attempt in range(max_retries):
+            try:
+                timeout_obj = aiohttp.ClientTimeout(total=timeout)
+                async with session.get(url, ssl=ssl_context, timeout=timeout_obj) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        break
+                    else:
+                        print(f"Station {code}, page {page}: HTTP {response.status}")
+                        if attempt == max_retries - 1:
+                            return datos
+                        
+            except asyncio.TimeoutError:
+                print(f"Station {code}, page {page}: Request timed out (attempt {attempt + 1}/{max_retries})")
+                if attempt == max_retries - 1:
+                    print(f"Station {code}: Max retries reached, skipping")
+                    return datos
+                await asyncio.sleep(1.5 ** attempt)
+                
+            except Exception as e:
+                print(f"Station {code}, page {page}: Request error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    print(f"Station {code}: Max retries reached, skipping")
+                    return datos
+                await asyncio.sleep(1.5 ** attempt)
+        else:
+            # Si llegamos aquí sin break, falló todos los intentos
+            return datos
+            
+        # Procesar respuesta
+        try:
+            values = data.get("values", [])
+            if not values:
+                break
+                
+            datos.extend(values)
+            page += 1
+            
+            # Paramos si ya tenemos más de 72 horas de datos
+            fechas = [pd.to_datetime(d['fecha']) for d in datos]
+            if fechas and (max(fechas) - min(fechas)).total_seconds() > 72 * 3600:
+                break
+                
+        except Exception as e:
+            print(f"Station {code}, page {page}: Data processing error: {e}")
+            break
+            
+    return datos
+
+async def obtener_metadata_sp_async(session, code, timeout=20, max_retries=2):
+    """
+    Versión asíncrona para obtener metadata de estación.
+    """
+    url = f"https://sigran.antioquia.gov.co/api/v1/estaciones/sp_{code}/"
+    
+    # Configurar SSL para ignorar certificados
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    for attempt in range(max_retries):
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+            async with session.get(url, ssl=ssl_context, timeout=timeout_obj) as response:
+                if response.status == 200:
+                    d = await response.json()
+                    return {
+                        "estacion": code,
+                        "codigo": d.get("codigo"),
+                        "descripcion": d.get("descripcion"),
+                        "nombre_web": d.get("nombre_web"),
+                        "latitud": float(d.get("latitud", 0)),
+                        "longitud": float(d.get("longitud", 0)),
+                        "municipio": d.get("municipio"),
+                        "region": d.get("region")
+                    }
+                else:
+                    print(f"Station {code} metadata: HTTP {response.status}")
+                    
+        except asyncio.TimeoutError:
+            print(f"Station {code} metadata: Request timed out (attempt {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+                
+        except Exception as e:
+            print(f"Station {code} metadata: Request error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+    
+    print(f"Station {code} metadata: Max retries reached, skipping")
+    return None
+
+async def procesar_estacion_completa_async(session, code):
+    """
+    Versión asíncrona que procesa una estación completa.
+    """
+    try:
+        # Obtener datos y metadata de forma concurrente
+        datos_task = obtener_datos_estacion_async(session, code)
+        meta_task = obtener_metadata_sp_async(session, code)
+        
+        # Esperar ambas tareas concurrentemente
+        datos, meta = await asyncio.gather(datos_task, meta_task, return_exceptions=True)
+        
+        # Manejar excepciones
+        if isinstance(datos, Exception):
+            print(f"Station {code}: Error getting data: {datos}")
+            datos = []
+        if isinstance(meta, Exception):
+            print(f"Station {code}: Error getting metadata: {meta}")
+            meta = None
+        
+        # Procesar datos
+        resumen = procesar_datos(datos)
+        
+        if resumen and meta:
+            resumen["estacion"] = code
+            meta.update(resumen)
+            return {
+                'success': True,
+                'code': code,
+                'resumen': resumen,
+                'meta': meta
+            }
+        else:
+            return {
+                'success': False,
+                'code': code,
+                'error': 'No data or metadata available'
+            }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'code': code,
+            'error': str(e)
+        }
+
+async def cargar_todas_estaciones_async():
+    """
+    Función principal asíncrona para cargar todas las estaciones de forma paralela.
+    """
+    print(f"Starting ASYNC data collection from {len(sp_codes)} stations...")
+    start_time = time.time()
+    
+    # Configurar conector con límites apropiados
+    connector = aiohttp.TCPConnector(
+        limit=20,  # Total de conexiones
+        limit_per_host=10,  # Conexiones por host
+        ssl=False  # Desactivar validación SSL
+    )
+    
+    successful_stations = 0
+    failed_stations = 0
+    resultados = []
+    metadata = []
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Crear tareas para todas las estaciones
+        tasks = [procesar_estacion_completa_async(session, code) for code in sp_codes]
+        
+        # Ejecutar todas las tareas concurrentemente
+        print(f"Executing {len(tasks)} concurrent requests...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Procesar resultados
+        for i, resultado in enumerate(results):
+            code = sp_codes[i]
+            
+            if isinstance(resultado, Exception):
+                failed_stations += 1
+                print(f"✗ Station {code}: Exception: {resultado}")
+                continue
+                
+            if resultado['success']:
+                resultados.append(resultado['resumen'])
+                metadata.append(resultado['meta'])
+                successful_stations += 1
+                print(f"✓ Station {code}: Data loaded successfully")
+            else:
+                failed_stations += 1
+                print(f"✗ Station {code}: {resultado['error']}")
+    
+    elapsed_time = time.time() - start_time
+    success_rate = (successful_stations / len(sp_codes)) * 100 if sp_codes else 0
+    
+    print(f"\n🚀 ASYNC data collection completed:")
+    print(f"   • Total time: {elapsed_time:.1f} seconds")
+    print(f"   • Successful stations: {successful_stations}/{len(sp_codes)} ({success_rate:.1f}%)")
+    print(f"   • Failed stations: {failed_stations}")
+    print(f"   • Average time per station: {elapsed_time/len(sp_codes):.2f}s")
+    print(f"   • Effective concurrency: {len(sp_codes)/elapsed_time:.1f} stations/second")
+    
+    return resultados, metadata
+
+def procesar_estacion_completa(code):
+    """
+    Procesa una estación completa: obtiene datos, procesa y obtiene metadata.
+    Función helper para usar con ThreadPoolExecutor.
+    """
+    try:
+        # Use cache for both data and metadata
+        datos = get_cached_or_fetch(f"data_{code}", obtener_datos_estacion, code)
+        resumen = procesar_datos(datos)
+        meta = get_cached_or_fetch(f"meta_{code}", obtener_metadata_sp, code)
+        
+        if resumen and meta:
+            resumen["estacion"] = code
+            meta.update(resumen)
+            return {
+                'success': True,
+                'code': code,
+                'resumen': resumen,
+                'meta': meta
+            }
+        else:
+            return {
+                'success': False,
+                'code': code,
+                'error': 'No data or metadata available'
+            }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'code': code,
+            'error': str(e)
+        }
 
 def procesar_datos(datos, ahora=None):
     if not datos:
@@ -158,7 +421,7 @@ def procesar_datos(datos, ahora=None):
     df["fecha"] = pd.to_datetime(df["fecha"], utc=True)
     df["muestra"] = pd.to_numeric(df["muestra"], errors='coerce')
 
-    ahora = ahora or datetime.utcnow().replace(tzinfo=pytz.UTC)
+    ahora = ahora or datetime.now(timezone.utc)
 
     acumulados = {
         "acum_6h": df[(df["fecha"] > ahora - timedelta(hours=6)) & (df["fecha"] <= ahora)]["muestra"].sum(),
@@ -231,33 +494,76 @@ def procesar_datos(datos, ahora=None):
 resultados = []
 metadata = []
 
-print(f"Starting data collection from {len(sp_codes)} stations...")
-start_time = time.time()
-
-for i, code in enumerate(sp_codes, 1):
-    print(f"Processing station {code} ({i}/{len(sp_codes)})...")
-    
-    try:
-        # Use cache for both data and metadata
-        datos = get_cached_or_fetch(f"data_{code}", obtener_datos_estacion, code)
-        resumen = procesar_datos(datos)
-        meta = get_cached_or_fetch(f"meta_{code}", obtener_metadata_sp, code)
+# ====== EJECUCIÓN ASÍNCRONA (FASE 3) ======
+# Ejecutar la función asíncrona principal
+try:
+    # Verificar si ya estamos en un loop de eventos (como en Jupyter)
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        # Estamos en un entorno que ya tiene un loop corriendo
+        print("⚠️  Event loop already running. Using nest_asyncio workaround...")
+        import nest_asyncio
+        nest_asyncio.apply()
+        resultados, metadata = loop.run_until_complete(cargar_todas_estaciones_async())
+    else:
+        # No hay loop corriendo, podemos usar asyncio.run normalmente
+        resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
         
-        if resumen and meta:
-            resumen["estacion"] = code
-            meta.update(resumen)
-            resultados.append(resumen)
-            metadata.append(meta)
-            print(f"✓ Station {code}: Data loaded successfully")
-        else:
-            print(f"✗ Station {code}: No data or metadata available")
-            
-    except Exception as e:
-        print(f"✗ Station {code}: Unexpected error: {e}")
-        continue
+except ImportError:
+    # nest_asyncio no está disponible, usar asyncio.run
+    resultados, metadata = asyncio.run(cargar_todas_estaciones_async())
+except Exception as e:
+    print(f"❌ Error in async execution: {e}")
+    print("Falling back to synchronous version...")
+    
+    # Fallback al código sincrónico si falla el asíncrono
+    print(f"Starting parallel data collection from {len(sp_codes)} stations...")
+    start_time = time.time()
 
-elapsed_time = time.time() - start_time
-print(f"Data collection completed: {len(resultados)} stations loaded in {elapsed_time:.1f} seconds")
+    # Configurar el número de workers de forma inteligente
+    if len(sp_codes) <= 5:
+        max_workers = min(3, len(sp_codes))
+    elif len(sp_codes) <= 20:
+        max_workers = min(5, len(sp_codes))
+    else:
+        max_workers = min(10, len(sp_codes))
+
+    print(f"Using {max_workers} parallel workers for optimal API usage...")
+
+    successful_stations = 0
+    failed_stations = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_code = {executor.submit(procesar_estacion_completa, code): code for code in sp_codes}
+        
+        completed = 0
+        for future in as_completed(future_to_code):
+            completed += 1
+            code = future_to_code[future]
+            
+            try:
+                resultado = future.result()
+                
+                if resultado['success']:
+                    resultados.append(resultado['resumen'])
+                    metadata.append(resultado['meta'])
+                    successful_stations += 1
+                    print(f"✓ Station {code}: Data loaded successfully ({completed}/{len(sp_codes)}) - Success: {successful_stations}")
+                else:
+                    failed_stations += 1
+                    print(f"✗ Station {code}: {resultado['error']} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
+                    
+            except Exception as e:
+                failed_stations += 1
+                print(f"✗ Station {code}: Unexpected error: {e} ({completed}/{len(sp_codes)}) - Failed: {failed_stations}")
+
+    elapsed_time = time.time() - start_time
+    success_rate = (successful_stations / len(sp_codes)) * 100 if sp_codes else 0
+    print(f"\n� Fallback parallel data collection completed:")
+    print(f"   • Total time: {elapsed_time:.1f} seconds")
+    print(f"   • Successful stations: {successful_stations}/{len(sp_codes)} ({success_rate:.1f}%)")
+    print(f"   • Failed stations: {failed_stations}")
+    print(f"   • Average time per station: {elapsed_time/len(sp_codes):.2f}s")
 
 df_meta = pd.DataFrame(metadata)
 

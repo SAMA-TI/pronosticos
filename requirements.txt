@@ -8,3 +8,5 @@ pandas
 pytz
 openpyxl
 gunicorn
+aiohttp
+nest-asyncio
